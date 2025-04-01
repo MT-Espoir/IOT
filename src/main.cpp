@@ -3,11 +3,13 @@
 #define LED_PIN 48  // Add LED pin definition
 
 #include <WiFi.h>
-#include <Arduino_MQTT_Client.h>
-#include <ThingsBoard.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
 #include "DHT20.h"
-#include "Wire.h"
-#include <ArduinoOTA.h>
 
 constexpr char WIFI_SSID[] = "Min";
 constexpr char WIFI_PASSWORD[] = "123456789";
@@ -20,317 +22,185 @@ constexpr uint16_t THINGSBOARD_PORT = 1883U;
 constexpr uint32_t MAX_MESSAGE_SIZE = 1024U;
 constexpr uint32_t SERIAL_DEBUG_BAUD = 115200U;
 
-// Shared attribute keys
-constexpr char SCHEDULE_ATTR[] = "schedule";
-constexpr char LED_STATE_ATTR[] = "ledState";
-
-// Variables for scheduling
-struct TimeSchedule {
-  int onHour = 0;
-  int onMinute = 0;
-  int offHour = 0; 
-  int offMinute = 0;
-  bool enabled = false;
-};
-
-TimeSchedule deviceSchedule;
-bool scheduleChanged = false;
-bool ledState = false;
-
-uint32_t previousStateChange;
-uint32_t lastTimeCheck = 0;
-constexpr uint32_t TIME_CHECK_INTERVAL = 60000; // Check time every minute
-
-constexpr int16_t telemetrySendInterval = 10000U;
-uint32_t previousDataSend;
+const char* ledStateControlKey = "ledState"; // Sử dụng ledState làm key
+volatile bool ledState = false;
+QueueHandle_t ledStateQueue;
 
 WiFiClient wifiClient;
-Arduino_MQTT_Client mqttClient(wifiClient);
-ThingsBoard tb(mqttClient, MAX_MESSAGE_SIZE);
+PubSubClient client(wifiClient);
 
 DHT20 dht20;
 
 float temperature = NAN;
 float humidity = NAN;
 
-// RPC callback to get current sensor data
-RPC_Response requestSensorData(const RPC_Data &data) {
-  Serial.println("Received request for current sensor data");
-  
-  dht20.read();
-  float temp = dht20.getTemperature();
-  float hum = dht20.getHumidity();
-  
-  // Create JSON response with current values
-  StaticJsonDocument<200> respData;
-  respData["temperature"] = temp;
-  respData["humidity"] = hum;
-  respData["rssi"] = WiFi.RSSI();
-  
-  String respStr;
-  serializeJson(respData, respStr);
-  
-  return RPC_Response("sensorDataResponse", respStr);
-}
-
-// RPC callback to control LED
-RPC_Response setLedState(const RPC_Data &data) {
-  Serial.println("Received LED control command");
-  
-  // Get new LED state from RPC data
-  ledState = data;
-  
-  // Apply the state to LED
-  digitalWrite(LED_PIN, ledState);
-  
-  Serial.print("Set LED state to: ");
-  Serial.println(ledState);
-  
-  // Send updated attribute to ThingsBoard
-  tb.sendAttributeData(LED_STATE_ATTR, ledState);
-  
-  return RPC_Response("ledState", ledState);
-}
-
-// RPC callback to update schedule
-RPC_Response updateSchedule(const RPC_Data &data) {
-  Serial.println("Received schedule update");
-  
-  // Parse the schedule data from JSON
-  JsonObject scheduleObj = data;
-  
-  deviceSchedule.onHour = scheduleObj["onHour"];
-  deviceSchedule.onMinute = scheduleObj["onMinute"];
-  deviceSchedule.offHour = scheduleObj["offHour"];
-  deviceSchedule.offMinute = scheduleObj["offMinute"];
-  deviceSchedule.enabled = scheduleObj["enabled"];
-  
-  scheduleChanged = true;
-  
-  Serial.print("Schedule updated - On: ");
-  Serial.print(deviceSchedule.onHour);
-  Serial.print(":");
-  Serial.print(deviceSchedule.onMinute);
-  Serial.print(", Off: ");
-  Serial.print(deviceSchedule.offHour);
-  Serial.print(":");
-  Serial.print(deviceSchedule.offMinute);
-  Serial.print(", Enabled: ");
-  Serial.println(deviceSchedule.enabled ? "Yes" : "No");
-  
-  return RPC_Response("scheduleUpdated", true);
-}
-
-// Array of RPC callbacks
-const std::array<RPC_Callback, 3U> callbacks = {
-  RPC_Callback{ "requestSensorData", requestSensorData },
-  RPC_Callback{ "setLedState", setLedState },
-  RPC_Callback{ "updateSchedule", updateSchedule }
-};
-
-// Process shared attributes updates
-void processSharedAttributes(const Shared_Attribute_Data &data) {
-  for (auto it = data.begin(); it != data.end(); ++it) {
-    if (strcmp(it->key().c_str(), SCHEDULE_ATTR) == 0) {
-      // Parse the schedule JSON
-      JsonObject scheduleObj = it->value();
-      
-      deviceSchedule.onHour = scheduleObj["onHour"];
-      deviceSchedule.onMinute = scheduleObj["onMinute"];
-      deviceSchedule.offHour = scheduleObj["offHour"];
-      deviceSchedule.offMinute = scheduleObj["offMinute"];
-      deviceSchedule.enabled = scheduleObj["enabled"];
-      
-      Serial.print("Received schedule - On: ");
-      Serial.print(deviceSchedule.onHour);
-      Serial.print(":");
-      Serial.print(deviceSchedule.onMinute);
-      Serial.print(", Off: ");
-      Serial.print(deviceSchedule.offHour);
-      Serial.print(":");
-      Serial.print(deviceSchedule.offMinute);
-      Serial.print(", Enabled: ");
-      Serial.println(deviceSchedule.enabled ? "Yes" : "No");
-    } else if (strcmp(it->key().c_str(), LED_STATE_ATTR) == 0) {
-      ledState = it->value().as<bool>();
-      digitalWrite(LED_PIN, ledState);
-      
-      Serial.print("LED state updated to: ");
-      Serial.println(ledState);
-    }
-  }
-}
-
-// Define shared attributes to subscribe to
-const std::array<const char *, 2U> SHARED_ATTRIBUTES_LIST = {
-  SCHEDULE_ATTR,
-  LED_STATE_ATTR
-};
-
-// Create callback for processing shared attributes
-const Shared_Attribute_Callback attributes_callback(&processSharedAttributes, SHARED_ATTRIBUTES_LIST.cbegin(), SHARED_ATTRIBUTES_LIST.cend());
-
-// Create attribute request callback
-const Attribute_Request_Callback attribute_request_callback(&processSharedAttributes, SHARED_ATTRIBUTES_LIST.cbegin(), SHARED_ATTRIBUTES_LIST.cend());
-
-void InitWiFi() {
-  Serial.println("Connecting to AP ...");
-  // Attempting to establish a connection to the given WiFi network
+// Hàm để kết nối WiFi
+void connectWifi() {
+  Serial.print("Connecting to WiFi...");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED) {
-    // Delay 500ms until a connection has been successfully established
-    delay(500);
-    Serial.print(".");
+      delay(500);
+      Serial.print(".");
   }
-  Serial.println("Connected to AP");
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
+  Serial.println("Connected to WiFi");
 }
 
-const bool reconnect() {
-  // Check to ensure we aren't connected yet
-  const wl_status_t status = WiFi.status();
-  if (status == WL_CONNECTED) {
-    return true;
+// Hàm để kết nối ThingsBoard
+void connectThingsBoard() {
+  while (!client.connect("ESP32Client", TOKEN, nullptr)) {
+      Serial.print("Failed to connect to ThingsBoard, rc=");
+      Serial.println(client.state());
+      delay(5000);
   }
-  // If we aren't establish a new connection to the given WiFi network
-  InitWiFi();
-  return true;
+  Serial.println("Connected to ThingsBoard");
+  // Đăng ký nhận thông tin shared attributes
+  client.subscribe("v1/devices/me/attributes");
+  // Yêu cầu giá trị ban đầu của các shared attributes
+  String payload = "{\"shared\":[\"" + String(ledStateControlKey) + "\"]}";
+  client.publish("v1/devices/me/attributes", payload.c_str());
+  Serial.println("Sent request for shared attributes.");
 }
 
-// Function to check and apply schedule
-void checkSchedule() {
-  if (!deviceSchedule.enabled) {
-    return; // Schedule is disabled
+// Callback function khi nhận được tin nhắn MQTT
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.println("Callback function called in MQTT Task.");
+  Serial.print("Message arrived in topic: ");
+  Serial.println(topic);
+  Serial.print("Message:");
+  for (int i = 0; i < length; i++) {
+      Serial.print((char)payload[i]);
   }
-  
-  // Get current time from NTP (in real implementation)
-  // For this demo, we'll just use millis to cycle through a day quickly for testing
-  unsigned long currentMillis = millis();
-  unsigned long dayProgress = (currentMillis / 1000) % 86400; // Seconds in a day
-  
-  int currentHour = dayProgress / 3600;
-  int currentMinute = (dayProgress % 3600) / 60;
-  
-  // Check if we should turn ON
-  if (currentHour == deviceSchedule.onHour && currentMinute == deviceSchedule.onMinute) {
-    if (!ledState) {
-      ledState = true;
-      digitalWrite(LED_PIN, ledState);
-      tb.sendAttributeData(LED_STATE_ATTR, ledState);
-      Serial.println("Schedule: Turning LED ON");
-    }
+  Serial.println();
+
+  // Xử lý phản hồi shared attributes
+  if (strstr(topic, "attributes")) {
+      Serial.println("Processing shared attributes response...");
+      DynamicJsonDocument doc(1024);
+      deserializeJson(doc, payload, length);
+
+      if (doc.containsKey("ledState")) {
+          String ledStateStr = doc["ledState"].as<String>();
+          Serial.print("ledState value from TB: ");
+          Serial.println(ledStateStr);
+
+          bool newLedState = false;
+          if (ledStateStr == "ON") {
+              newLedState = true;
+              Serial.println("ledState is now TRUE");
+          } else {
+              newLedState = false;
+              Serial.println("ledState is now FALSE");
+          }
+
+          // Send the new LED state to the LED control task via the queue
+          if (xQueueSend(ledStateQueue, &newLedState, 0) != pdTRUE) {
+              Serial.println("Failed to send LED state to queue.");
+          }
+          Serial.print("Sent ledState to LED Control Task: ");
+          Serial.println(newLedState ? "ON" : "OFF");
+      } else {
+          Serial.println("Attribute 'ledState' not found in response.");
+      }
   }
+}
+
+// RPC callback to get current sensor data
+void wifiTask(void *pvParameters) {
+  for (;;) {
+      if (WiFi.status() != WL_CONNECTED) {
+          connectWifi();
+      }
+      vTaskDelay(pdMS_TO_TICKS(5000)); // Check WiFi status every 5 seconds
+  }
+}
+
+// Task to handle MQTT connection and communication with ThingsBoard
+void mqttTask(void *pvParameters) {
+  client.setServer(THINGSBOARD_SERVER, THINGSBOARD_PORT);
+  client.setCallback(callback);
+
+  for (;;) {
+      if (!client.connected()) {
+          connectThingsBoard();
+      }
+      client.loop();
+      vTaskDelay(pdMS_TO_TICKS(100)); // Process MQTT messages
+  }
+}
+
+// Task to control the LED based on the ledState variable
+void ledControlTask(void *pvParameters) {
+  bool currentLedState = false;
+  for (;;) {
+      if (xQueueReceive(ledStateQueue, &currentLedState, portMAX_DELAY) == pdTRUE) {
+          digitalWrite(LED_PIN, currentLedState ? HIGH : LOW);
+          Serial.print("Setting LED to: ");
+          Serial.println(currentLedState ? "ON" : "OFF");
+      }
+  }
+}
+
+void sensorTask(void *pvParameters) {
+  // Delay first reading to ensure WiFi and MQTT are connected
+  vTaskDelay(pdMS_TO_TICKS(5000));
   
-  // Check if we should turn OFF
-  if (currentHour == deviceSchedule.offHour && currentMinute == deviceSchedule.offMinute) {
-    if (ledState) {
-      ledState = false;
-      digitalWrite(LED_PIN, ledState);
-      tb.sendAttributeData(LED_STATE_ATTR, ledState);
-      Serial.println("Schedule: Turning LED OFF");
-    }
+  // Buffer for JSON payload
+  char msg[MAX_MESSAGE_SIZE];
+  StaticJsonDocument<200> jsonDoc;
+  
+  for (;;) {
+    // Read sensor data
+    int status = dht20.read();
+    
+    if (status == DHT20_OK) {
+      // Get temperature and humidity values
+      temperature = dht20.getTemperature();
+      humidity = dht20.getHumidity();
+      
+      Serial.print("Temperature: ");
+      Serial.print(temperature, 1);
+      Serial.print("°C, Humidity: ");
+      Serial.print(humidity, 1);
+      Serial.println("%");
+      
+      // Create JSON document with sensor data
+      jsonDoc.clear();
+      jsonDoc["temperature"] = round(temperature * 10) / 10.0;
+      jsonDoc["humidity"] = round(humidity * 10) / 10.0;
+      
+      // Serialize JSON to string
+      serializeJson(jsonDoc, msg);
+      
+      // Publish to ThingsBoard if connected
+      if (client.connected()) {
+        client.publish("v1/devices/me/telemetry", msg);
+        Serial.println("Sensor data published to ThingsBoard");
+      } else {
+        Serial.println("MQTT client not connected. Data not published.");
+      }
+    }   
+    vTaskDelay(pdMS_TO_TICKS(10000));
   }
 }
 
 void setup() {
-  Serial.begin(SERIAL_DEBUG_BAUD);
+  Serial.begin(115200);
   pinMode(LED_PIN, OUTPUT);
-  
-  delay(1000);
-  Serial.println("====== DEVICE STARTING ======");
-  Serial.println("Initializing WiFi...");
-  InitWiFi();
-
-  Wire.begin(SDA_PIN, SCL_PIN);
+  digitalWrite(LED_PIN, LOW); // Đảm bảo ban đầu đèn tắt
   dht20.begin();
-  
-  Serial.println("Device initialization complete");
+
+  // Create a queue to pass LED state updates between tasks
+  ledStateQueue = xQueueCreate(1, sizeof(bool)); 
+
+  // Create tasks
+  xTaskCreate(wifiTask, "WiFi Task", 4096, NULL, 1, NULL); 
+  xTaskCreate(mqttTask, "MQTT Task", 8192, NULL, 2, NULL); 
+  xTaskCreate(ledControlTask, "LED Control Task", 2048, NULL, 3, NULL); 
+  xTaskCreate(sensorTask, "Sensor Task", 4096, NULL, 2, NULL);
+
 }
 
 void loop() {
-  delay(10);
-  
-  if (!reconnect()) {
-    return;
-  }
-
-  if (!tb.connected()) {
-    Serial.print("Connecting to ThingsBoard: ");
-    Serial.print(THINGSBOARD_SERVER);
-    Serial.print(" with token ");
-    Serial.println(TOKEN);
-    
-    if (!tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT)) {
-      Serial.println("Failed to connect to ThingsBoard");
-      return;
-    }
-    
-    // Subscribe to RPC commands
-    if (!tb.RPC_Subscribe(callbacks.cbegin(), callbacks.cend())) {
-      Serial.println("Failed to subscribe for RPC");
-      return;
-    }
-    
-    // Subscribe to shared attributes
-    if (!tb.Shared_Attributes_Subscribe(attributes_callback)) {
-      Serial.println("Failed to subscribe for shared attributes");
-      return;
-    }
-    
-    // Request shared attributes values
-    if (!tb.Shared_Attributes_Request(attribute_request_callback)) {
-      Serial.println("Failed to request shared attributes");
-      return;
-    }
-    
-    Serial.println("ThingsBoard subscriptions successful");
-  }
-  
-  // Check schedule based on time
-  if (millis() - lastTimeCheck > TIME_CHECK_INTERVAL) {
-    lastTimeCheck = millis();
-    checkSchedule();
-  }
-
-  // Send telemetry data periodically
-  if (millis() - previousDataSend > telemetrySendInterval) {
-    previousDataSend = millis();
-
-    dht20.read();
-    
-    float temperature = dht20.getTemperature();
-    float humidity = dht20.getHumidity();
-
-    if (isnan(temperature) || isnan(humidity)) {
-      Serial.println("Failed to read from DHT20 sensor!");
-    } else {
-      Serial.print("Temperature: ");
-      Serial.print(temperature);
-      Serial.print(" °C, Humidity: ");
-      Serial.print(humidity);
-      Serial.println(" %");
-
-      tb.sendTelemetryData("temperature", temperature);
-      tb.sendTelemetryData("humidity", humidity);
-    }
-
-    tb.sendAttributeData("rssi", WiFi.RSSI());
-    tb.sendAttributeData("channel", WiFi.channel());
-    tb.sendAttributeData("bssid", WiFi.BSSIDstr().c_str());
-    tb.sendAttributeData("localIp", WiFi.localIP().toString().c_str());
-    tb.sendAttributeData("ssid", WiFi.SSID().c_str());
-    
-    // Also send current schedule status
-    StaticJsonDocument<200> scheduleStatus;
-    scheduleStatus["onHour"] = deviceSchedule.onHour;
-    scheduleStatus["onMinute"] = deviceSchedule.onMinute;
-    scheduleStatus["offHour"] = deviceSchedule.offHour;
-    scheduleStatus["offMinute"] = deviceSchedule.offMinute;
-    scheduleStatus["enabled"] = deviceSchedule.enabled;
-    
-    tb.sendAttributeData(SCHEDULE_ATTR, scheduleStatus);
-  }
-
-  tb.loop();
+  // Loop function is empty in FreeRTOS as tasks are running independently
+  vTaskDelay(portMAX_DELAY); // Prevent the main loop from exiting
 }
