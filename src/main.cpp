@@ -3,9 +3,9 @@
 
 #include <ArduinoHttpClient.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
 #include <HTTPUpdate.h>
 #include <Update.h>
+#include <HTTPClient.h>
 #include <Arduino_MQTT_Client.h>
 #include <ThingsBoard.h>
 #include "DHT20.h"
