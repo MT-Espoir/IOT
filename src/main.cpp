@@ -1,6 +1,5 @@
 #define SDA_PIN GPIO_NUM_11
 #define SCL_PIN GPIO_NUM_12
-#define LED_PIN 48  // Add LED pin definition
 
 #include <WiFi.h>
 #include <Arduino_MQTT_Client.h>
@@ -8,6 +7,13 @@
 #include "DHT20.h"
 #include "Wire.h"
 #include <ArduinoOTA.h>
+#include <ESPmDNS.h>
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
+#include <Update.h>
+
+#define HOSTNAME "ESP32-OTA"
+#define OTA_PASSWORD "otapassword"
 
 constexpr char WIFI_SSID[] = "Min";
 constexpr char WIFI_PASSWORD[] = "123456789";
@@ -17,29 +23,15 @@ constexpr char TOKEN[] = "mae15of5vf8oc2v3bdap";
 constexpr char THINGSBOARD_SERVER[] = "app.coreiot.io";
 constexpr uint16_t THINGSBOARD_PORT = 1883U;
 
+constexpr char OTA_SERVER[] = "http://192.168.1.100:8000"; // Replace with your server IP
+constexpr char FIRMWARE_VERSION[] = "1.0.0"; // Current firmware version
+constexpr uint32_t OTA_CHECK_INTERVAL = 60000; // Check for updates every minute (for testing)
+uint32_t lastOTACheck = 0;
+
 constexpr uint32_t MAX_MESSAGE_SIZE = 1024U;
 constexpr uint32_t SERIAL_DEBUG_BAUD = 115200U;
 
-// Shared attribute keys
-constexpr char SCHEDULE_ATTR[] = "schedule";
-constexpr char LED_STATE_ATTR[] = "ledState";
-
-// Variables for scheduling
-struct TimeSchedule {
-  int onHour = 0;
-  int onMinute = 0;
-  int offHour = 0; 
-  int offMinute = 0;
-  bool enabled = false;
-};
-
-TimeSchedule deviceSchedule;
-bool scheduleChanged = false;
-bool ledState = false;
-
 uint32_t previousStateChange;
-uint32_t lastTimeCheck = 0;
-constexpr uint32_t TIME_CHECK_INTERVAL = 60000; // Check time every minute
 
 constexpr int16_t telemetrySendInterval = 10000U;
 uint32_t previousDataSend;
@@ -53,125 +45,103 @@ DHT20 dht20;
 float temperature = NAN;
 float humidity = NAN;
 
-// RPC callback to get current sensor data
-RPC_Response requestSensorData(const RPC_Data &data) {
-  Serial.println("Received request for current sensor data");
+void checkForUpdates() {
+  Serial.println("Checking for firmware updates...");
   
-  dht20.read();
-  float temp = dht20.getTemperature();
-  float hum = dht20.getHumidity();
+  // Fix: Use HTTPClient properly
+  HTTPClient http;
+  String versionUrl = String(OTA_SERVER) + "/version.txt";
+  http.begin(versionUrl);
   
-  // Create JSON response with current values
-  StaticJsonDocument<200> respData;
-  respData["temperature"] = temp;
-  respData["humidity"] = hum;
-  respData["rssi"] = WiFi.RSSI();
+  int httpCode = http.GET();
   
-  String respStr;
-  serializeJson(respData, respStr);
+  if (httpCode == HTTP_CODE_OK) {
+    String newVersion = http.getString();
+    newVersion.trim();
+    
+    Serial.print("Current version: ");
+    Serial.println(FIRMWARE_VERSION);
+    Serial.print("Available version: ");
+    Serial.println(newVersion);
+    
+    // If versions are different, update
+    if (String(FIRMWARE_VERSION) != newVersion && newVersion.length() > 0) {
+      Serial.println("New version available. Starting update...");
+      
+      // Report update status to ThingsBoard
+      tb.sendAttributeData("firmwareUpdateStatus", "updating");
+      tb.sendAttributeData("newFirmwareVersion", newVersion.c_str());
+      
+      // Start the update
+      String firmwareUrl = String(OTA_SERVER) + "/firmware.bin";
+      http.end();
+      
+      http.begin(firmwareUrl);
+      httpCode = http.GET();
+      
+      if (httpCode == HTTP_CODE_OK) {
+        // Get the update
+        int contentLength = http.getSize();
+        
+        if (contentLength > 0) {
+          Serial.println("Starting HTTP update...");
+          WiFiClient *client = http.getStreamPtr();
+          
+          t_httpUpdate_return ret = httpUpdate.update(*client, firmwareUrl);
+          
+          switch (ret) {
+            case HTTP_UPDATE_FAILED:
+              Serial.printf("HTTP_UPDATE_FAILED Error (%d): %s\n", 
+                httpUpdate.getLastError(), 
+                httpUpdate.getLastErrorString().c_str());
+              tb.sendAttributeData("firmwareUpdateStatus", "failed");
+              break;
+              
+            case HTTP_UPDATE_NO_UPDATES:
+              Serial.println("HTTP_UPDATE_NO_UPDATES");
+              tb.sendAttributeData("firmwareUpdateStatus", "no_update");
+              break;
+              
+            case HTTP_UPDATE_OK:
+              Serial.println("HTTP_UPDATE_OK");
+              tb.sendAttributeData("firmwareUpdateStatus", "success");
+              delay(1000);
+              ESP.restart(); // Restart after update
+              break;
+          }
+        }
+      } else {
+        Serial.print("Failed to download firmware: ");
+        Serial.println(httpCode);
+        tb.sendAttributeData("firmwareUpdateStatus", "download_failed");
+      }
+    } else {
+      Serial.println("Already on latest version");
+      tb.sendAttributeData("firmwareUpdateStatus", "up_to_date");
+    }
+  } else {
+    Serial.print("Failed to check version: ");
+    Serial.println(httpCode);
+    tb.sendAttributeData("firmwareUpdateStatus", "check_failed");
+  }
   
-  return RPC_Response("sensorDataResponse", respStr);
+  http.end();
 }
 
-// RPC callback to control LED
-RPC_Response setLedState(const RPC_Data &data) {
-  Serial.println("Received LED control command");
-  
-  // Get new LED state from RPC data
-  ledState = data;
-  
-  // Apply the state to LED
-  digitalWrite(LED_PIN, ledState);
-  
-  Serial.print("Set LED state to: ");
-  Serial.println(ledState);
-  
-  // Send updated attribute to ThingsBoard
-  tb.sendAttributeData(LED_STATE_ATTR, ledState);
-  
-  return RPC_Response("ledState", ledState);
-}
-
-// RPC callback to update schedule
-RPC_Response updateSchedule(const RPC_Data &data) {
-  Serial.println("Received schedule update");
-  
-  // Parse the schedule data from JSON
-  JsonObject scheduleObj = data;
-  
-  deviceSchedule.onHour = scheduleObj["onHour"];
-  deviceSchedule.onMinute = scheduleObj["onMinute"];
-  deviceSchedule.offHour = scheduleObj["offHour"];
-  deviceSchedule.offMinute = scheduleObj["offMinute"];
-  deviceSchedule.enabled = scheduleObj["enabled"];
-  
-  scheduleChanged = true;
-  
-  Serial.print("Schedule updated - On: ");
-  Serial.print(deviceSchedule.onHour);
-  Serial.print(":");
-  Serial.print(deviceSchedule.onMinute);
-  Serial.print(", Off: ");
-  Serial.print(deviceSchedule.offHour);
-  Serial.print(":");
-  Serial.print(deviceSchedule.offMinute);
-  Serial.print(", Enabled: ");
-  Serial.println(deviceSchedule.enabled ? "Yes" : "No");
-  
-  return RPC_Response("scheduleUpdated", true);
-}
-
-// Array of RPC callbacks
-const std::array<RPC_Callback, 3U> callbacks = {
-  RPC_Callback{ "requestSensorData", requestSensorData },
-  RPC_Callback{ "setLedState", setLedState },
-  RPC_Callback{ "updateSchedule", updateSchedule }
-};
-
-// Process shared attributes updates
+// Process shared attributes from ThingsBoard
 void processSharedAttributes(const Shared_Attribute_Data &data) {
-  for (auto it = data.begin(); it != data.end(); ++it) {
-    if (strcmp(it->key().c_str(), SCHEDULE_ATTR) == 0) {
-      // Parse the schedule JSON
-      JsonObject scheduleObj = it->value();
-      
-      deviceSchedule.onHour = scheduleObj["onHour"];
-      deviceSchedule.onMinute = scheduleObj["onMinute"];
-      deviceSchedule.offHour = scheduleObj["offHour"];
-      deviceSchedule.offMinute = scheduleObj["offMinute"];
-      deviceSchedule.enabled = scheduleObj["enabled"];
-      
-      Serial.print("Received schedule - On: ");
-      Serial.print(deviceSchedule.onHour);
-      Serial.print(":");
-      Serial.print(deviceSchedule.onMinute);
-      Serial.print(", Off: ");
-      Serial.print(deviceSchedule.offHour);
-      Serial.print(":");
-      Serial.print(deviceSchedule.offMinute);
-      Serial.print(", Enabled: ");
-      Serial.println(deviceSchedule.enabled ? "Yes" : "No");
-    } else if (strcmp(it->key().c_str(), LED_STATE_ATTR) == 0) {
-      ledState = it->value().as<bool>();
-      digitalWrite(LED_PIN, ledState);
-      
-      Serial.print("LED state updated to: ");
-      Serial.println(ledState);
+  Serial.println("Received shared attribute update");
+  
+  // Fix: Use containsKey instead of contains
+  if (data.containsKey("firmwareUpdate")) {
+    bool shouldUpdate = data["firmwareUpdate"];
+    if (shouldUpdate) {
+      Serial.println("Firmware update triggered remotely");
+      checkForUpdates();
     }
   }
 }
 
-// Define shared attributes to subscribe to
-const std::array<const char *, 2U> SHARED_ATTRIBUTES_LIST = {
-  SCHEDULE_ATTR,
-  LED_STATE_ATTR
-};
-
-// Create callback for processing shared attributes
-const Shared_Attribute_Callback attributes_callback(&processSharedAttributes, SHARED_ATTRIBUTES_LIST.cbegin(), SHARED_ATTRIBUTES_LIST.cend());
-
-// Create attribute request callback
-const Attribute_Request_Callback attribute_request_callback(&processSharedAttributes, SHARED_ATTRIBUTES_LIST.cbegin(), SHARED_ATTRIBUTES_LIST.cend());
 
 void InitWiFi() {
   Serial.println("Connecting to AP ...");
@@ -183,8 +153,6 @@ void InitWiFi() {
     Serial.print(".");
   }
   Serial.println("Connected to AP");
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
 }
 
 const bool reconnect() {
@@ -198,102 +166,116 @@ const bool reconnect() {
   return true;
 }
 
-// Function to check and apply schedule
-void checkSchedule() {
-  if (!deviceSchedule.enabled) {
-    return; // Schedule is disabled
-  }
+void setupOTA() {
+  // Set hostname for easier discovery
+  ArduinoOTA.setHostname(HOSTNAME);
   
-  // Get current time from NTP (in real implementation)
-  // For this demo, we'll just use millis to cycle through a day quickly for testing
-  unsigned long currentMillis = millis();
-  unsigned long dayProgress = (currentMillis / 1000) % 86400; // Seconds in a day
-  
-  int currentHour = dayProgress / 3600;
-  int currentMinute = (dayProgress % 3600) / 60;
-  
-  // Check if we should turn ON
-  if (currentHour == deviceSchedule.onHour && currentMinute == deviceSchedule.onMinute) {
-    if (!ledState) {
-      ledState = true;
-      digitalWrite(LED_PIN, ledState);
-      tb.sendAttributeData(LED_STATE_ATTR, ledState);
-      Serial.println("Schedule: Turning LED ON");
+  // Set password for OTA updates
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+
+  // OTA callbacks
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH) {
+      type = "sketch";
+    } else {  // U_FS
+      type = "filesystem";
     }
+    Serial.println("Start updating " + type);
+  });
+  
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+  });
+  
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+  
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  
+  // Enable mDNS discovery
+  if (MDNS.begin(HOSTNAME)) {
+    Serial.println("mDNS responder started");
+    // Add service to mDNS
+    MDNS.addService("arduino", "tcp", 3232);
+  } else {
+    Serial.println("Error setting up mDNS responder");
   }
   
-  // Check if we should turn OFF
-  if (currentHour == deviceSchedule.offHour && currentMinute == deviceSchedule.offMinute) {
-    if (ledState) {
-      ledState = false;
-      digitalWrite(LED_PIN, ledState);
-      tb.sendAttributeData(LED_STATE_ATTR, ledState);
-      Serial.println("Schedule: Turning LED OFF");
-    }
-  }
+  ArduinoOTA.begin();
+  Serial.println("OTA initialized");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
 }
 
 void setup() {
   Serial.begin(SERIAL_DEBUG_BAUD);
-  pinMode(LED_PIN, OUTPUT);
-  
   delay(1000);
-  Serial.println("====== DEVICE STARTING ======");
   Serial.println("Initializing WiFi...");
   InitWiFi();
 
   Wire.begin(SDA_PIN, SCL_PIN);
   dht20.begin();
   
-  Serial.println("Device initialization complete");
+  // Configure OTA
+  setupOTA();
+  
+  // Send initial firmware version to ThingsBoard
+  if (tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT)) {
+    tb.sendAttributeData("firmwareVersion", FIRMWARE_VERSION);
+    Serial.println("Connected to ThingsBoard and sent firmware version");
+    
+    // Fix: Use correct method name
+    if (!tb.Shared_Attributes_Subscribe(processSharedAttributes)) {
+      Serial.println("Failed to subscribe to attributes");
+    } else {
+      Serial.println("Subscribed to shared attributes");
+    }
+  }
 }
 
 void loop() {
-  delay(10);
+  // Handle ArduinoOTA
+  ArduinoOTA.handle();
   
+  delay(10);
+
   if (!reconnect()) {
     return;
   }
 
   if (!tb.connected()) {
-    Serial.print("Connecting to ThingsBoard: ");
+    Serial.print("Connecting to: ");
     Serial.print(THINGSBOARD_SERVER);
     Serial.print(" with token ");
     Serial.println(TOKEN);
-    
     if (!tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT)) {
-      Serial.println("Failed to connect to ThingsBoard");
+      Serial.println("Failed to connect");
       return;
+    } else {
+      // After connecting, subscribe to shared attributes
+      Serial.println("Subscribing to shared attributes...");
+      // Fix: Use correct method name
+      if (!tb.Shared_Attributes_Subscribe(processSharedAttributes)) {
+        Serial.println("Failed to subscribe to attributes");
+      }
     }
-    
-    // Subscribe to RPC commands
-    if (!tb.RPC_Subscribe(callbacks.cbegin(), callbacks.cend())) {
-      Serial.println("Failed to subscribe for RPC");
-      return;
-    }
-    
-    // Subscribe to shared attributes
-    if (!tb.Shared_Attributes_Subscribe(attributes_callback)) {
-      Serial.println("Failed to subscribe for shared attributes");
-      return;
-    }
-    
-    // Request shared attributes values
-    if (!tb.Shared_Attributes_Request(attribute_request_callback)) {
-      Serial.println("Failed to request shared attributes");
-      return;
-    }
-    
-    Serial.println("ThingsBoard subscriptions successful");
   }
   
-  // Check schedule based on time
-  if (millis() - lastTimeCheck > TIME_CHECK_INTERVAL) {
-    lastTimeCheck = millis();
-    checkSchedule();
+  // Check for updates periodically
+  if (millis() - lastOTACheck > OTA_CHECK_INTERVAL) {
+    lastOTACheck = millis();
+    checkForUpdates();
   }
-
-  // Send telemetry data periodically
+    
   if (millis() - previousDataSend > telemetrySendInterval) {
     previousDataSend = millis();
 
@@ -321,16 +303,22 @@ void loop() {
     tb.sendAttributeData("localIp", WiFi.localIP().toString().c_str());
     tb.sendAttributeData("ssid", WiFi.SSID().c_str());
     
-    // Also send current schedule status
-    StaticJsonDocument<200> scheduleStatus;
-    scheduleStatus["onHour"] = deviceSchedule.onHour;
-    scheduleStatus["onMinute"] = deviceSchedule.onMinute;
-    scheduleStatus["offHour"] = deviceSchedule.offHour;
-    scheduleStatus["offMinute"] = deviceSchedule.offMinute;
-    scheduleStatus["enabled"] = deviceSchedule.enabled;
-    
-    tb.sendAttributeData(SCHEDULE_ATTR, scheduleStatus);
+    // Also regularly send firmware version
+    tb.sendAttributeData("firmwareVersion", FIRMWARE_VERSION);
   }
 
   tb.loop();
 }
+
+  // TODO LIST update:
+  // 1.  Implement OTA Update:
+  //    1.1 Configure the ESP32 to check for firmware updates over HTTP or MQTT.
+  //    1.2 Deploy an update server and host a new firmware version.
+  // 2. Test the Update Process:
+  //    2.1 Trigger an OTA update and monitor the process.
+  //    2.2 Verify that the new firmware is running correctly after the update
+  // 3 Firmware Upload Test: Upload a new firmware version to the server and trigger an
+  //    3.1 OTA update.
+  //    3.2 Data Integrity Check: Verify that temperature and humidity data continue to be sent correctly after an update.
+  //    3.3 Implement an OTA update mechanism using either HTTP or MQTT.
+  //    3.4 Upload a new firmware version and trigger the update remotely
