@@ -1,19 +1,20 @@
 #define SDA_PIN GPIO_NUM_11
 #define SCL_PIN GPIO_NUM_12
 
+#include <ArduinoHttpClient.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
+#include <Update.h>
 #include <Arduino_MQTT_Client.h>
 #include <ThingsBoard.h>
 #include "DHT20.h"
 #include "Wire.h"
 #include <ArduinoOTA.h>
-#include <ESPmDNS.h>
-#include <HTTPClient.h>
-#include <HTTPUpdate.h>
-#include <Update.h>
 
-#define HOSTNAME "ESP32-OTA"
-#define OTA_PASSWORD "otapassword"
+
+constexpr char FIRMWARE_VERSION[] = "v1.0.0";
+constexpr char FIRMWARE_UPDATE_URL[] = "http://your-update-server.com/firmware/";
 
 constexpr char WIFI_SSID[] = "Min";
 constexpr char WIFI_PASSWORD[] = "123456789";
@@ -23,13 +24,11 @@ constexpr char TOKEN[] = "mae15of5vf8oc2v3bdap";
 constexpr char THINGSBOARD_SERVER[] = "app.coreiot.io";
 constexpr uint16_t THINGSBOARD_PORT = 1883U;
 
-constexpr char OTA_SERVER[] = "http://192.168.1.100:8000"; // Replace with your server IP
-constexpr char FIRMWARE_VERSION[] = "1.0.0"; // Current firmware version
-constexpr uint32_t OTA_CHECK_INTERVAL = 60000; // Check for updates every minute (for testing)
-uint32_t lastOTACheck = 0;
-
 constexpr uint32_t MAX_MESSAGE_SIZE = 1024U;
 constexpr uint32_t SERIAL_DEBUG_BAUD = 115200U;
+
+constexpr uint32_t CHECK_UPDATE_INTERVAL = 60000U; // Check for updates every 60 seconds
+uint32_t lastUpdateCheck = 0;
 
 uint32_t previousStateChange;
 
@@ -44,104 +43,6 @@ DHT20 dht20;
 
 float temperature = NAN;
 float humidity = NAN;
-
-void checkForUpdates() {
-  Serial.println("Checking for firmware updates...");
-  
-  // Fix: Use HTTPClient properly
-  HTTPClient http;
-  String versionUrl = String(OTA_SERVER) + "/version.txt";
-  http.begin(versionUrl);
-  
-  int httpCode = http.GET();
-  
-  if (httpCode == HTTP_CODE_OK) {
-    String newVersion = http.getString();
-    newVersion.trim();
-    
-    Serial.print("Current version: ");
-    Serial.println(FIRMWARE_VERSION);
-    Serial.print("Available version: ");
-    Serial.println(newVersion);
-    
-    // If versions are different, update
-    if (String(FIRMWARE_VERSION) != newVersion && newVersion.length() > 0) {
-      Serial.println("New version available. Starting update...");
-      
-      // Report update status to ThingsBoard
-      tb.sendAttributeData("firmwareUpdateStatus", "updating");
-      tb.sendAttributeData("newFirmwareVersion", newVersion.c_str());
-      
-      // Start the update
-      String firmwareUrl = String(OTA_SERVER) + "/firmware.bin";
-      http.end();
-      
-      http.begin(firmwareUrl);
-      httpCode = http.GET();
-      
-      if (httpCode == HTTP_CODE_OK) {
-        // Get the update
-        int contentLength = http.getSize();
-        
-        if (contentLength > 0) {
-          Serial.println("Starting HTTP update...");
-          WiFiClient *client = http.getStreamPtr();
-          
-          t_httpUpdate_return ret = httpUpdate.update(*client, firmwareUrl);
-          
-          switch (ret) {
-            case HTTP_UPDATE_FAILED:
-              Serial.printf("HTTP_UPDATE_FAILED Error (%d): %s\n", 
-                httpUpdate.getLastError(), 
-                httpUpdate.getLastErrorString().c_str());
-              tb.sendAttributeData("firmwareUpdateStatus", "failed");
-              break;
-              
-            case HTTP_UPDATE_NO_UPDATES:
-              Serial.println("HTTP_UPDATE_NO_UPDATES");
-              tb.sendAttributeData("firmwareUpdateStatus", "no_update");
-              break;
-              
-            case HTTP_UPDATE_OK:
-              Serial.println("HTTP_UPDATE_OK");
-              tb.sendAttributeData("firmwareUpdateStatus", "success");
-              delay(1000);
-              ESP.restart(); // Restart after update
-              break;
-          }
-        }
-      } else {
-        Serial.print("Failed to download firmware: ");
-        Serial.println(httpCode);
-        tb.sendAttributeData("firmwareUpdateStatus", "download_failed");
-      }
-    } else {
-      Serial.println("Already on latest version");
-      tb.sendAttributeData("firmwareUpdateStatus", "up_to_date");
-    }
-  } else {
-    Serial.print("Failed to check version: ");
-    Serial.println(httpCode);
-    tb.sendAttributeData("firmwareUpdateStatus", "check_failed");
-  }
-  
-  http.end();
-}
-
-// Process shared attributes from ThingsBoard
-void processSharedAttributes(const Shared_Attribute_Data &data) {
-  Serial.println("Received shared attribute update");
-  
-  // Fix: Use containsKey instead of contains
-  if (data.containsKey("firmwareUpdate")) {
-    bool shouldUpdate = data["firmwareUpdate"];
-    if (shouldUpdate) {
-      Serial.println("Firmware update triggered remotely");
-      checkForUpdates();
-    }
-  }
-}
-
 
 void InitWiFi() {
   Serial.println("Connecting to AP ...");
@@ -166,54 +67,53 @@ const bool reconnect() {
   return true;
 }
 
-void setupOTA() {
-  // Set hostname for easier discovery
-  ArduinoOTA.setHostname(HOSTNAME);
-  
-  // Set password for OTA updates
-  ArduinoOTA.setPassword(OTA_PASSWORD);
 
-  // OTA callbacks
-  ArduinoOTA.onStart([]() {
-    String type;
-    if (ArduinoOTA.getCommand() == U_FLASH) {
-      type = "sketch";
-    } else {  // U_FS
-      type = "filesystem";
+// Add this function before setup()
+void checkForUpdates() {
+  Serial.println("Checking for firmware updates...");
+  
+  WiFiClient client;
+  HTTPClient http;
+  
+  // Construct URL (firmware.bin will be the new firmware file)
+  String url = String(FIRMWARE_UPDATE_URL) + "firmware.bin";
+  Serial.println("Checking: " + url);
+  
+  http.begin(client, url);
+  
+  // Add version header so server can decide if update is needed
+  http.addHeader("x-ESP32-version", FIRMWARE_VERSION);
+  
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    // If update is available, apply it
+    Serial.println("Update found, starting update process...");
+    
+    // Start update process
+    t_httpUpdate_return ret = httpUpdate.update(client, url);
+    
+    // Handle update result
+    switch (ret) {
+      case HTTP_UPDATE_FAILED:
+        Serial.printf("HTTP update failed: (%d): %s\r\n", 
+                      httpUpdate.getLastError(),
+                      httpUpdate.getLastErrorString().c_str());
+        break;
+        
+      case HTTP_UPDATE_NO_UPDATES:
+        Serial.println("No updates available");
+        break;
+        
+      case HTTP_UPDATE_OK:
+        Serial.println("Update successful, restarting...");
+        // Device will restart automatically after successful update
+        break;
     }
-    Serial.println("Start updating " + type);
-  });
-  
-  ArduinoOTA.onEnd([]() {
-    Serial.println("\nEnd");
-  });
-  
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-  });
-  
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("Error[%u]: ", error);
-    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-    else if (error == OTA_END_ERROR) Serial.println("End Failed");
-  });
-  
-  // Enable mDNS discovery
-  if (MDNS.begin(HOSTNAME)) {
-    Serial.println("mDNS responder started");
-    // Add service to mDNS
-    MDNS.addService("arduino", "tcp", 3232);
   } else {
-    Serial.println("Error setting up mDNS responder");
+    Serial.printf("HTTP GET failed, error: %s\n", http.errorToString(httpCode).c_str());
   }
   
-  ArduinoOTA.begin();
-  Serial.println("OTA initialized");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
+  http.end();
 }
 
 void setup() {
@@ -222,32 +122,46 @@ void setup() {
   Serial.println("Initializing WiFi...");
   InitWiFi();
 
+  // Initialize OTA
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH)
+      type = "sketch";
+    else // U_SPIFFS
+      type = "filesystem";
+    Serial.println("Start updating " + type);
+  });
+  
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nOTA Update Complete");
+  });
+  
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("OTA Progress: %u%%\r", (progress / (total / 100)));
+  });
+  
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Authentication Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connection Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  
+  ArduinoOTA.begin();
+  Serial.println("OTA Ready");
+
+  // Initialize I2C and sensor
   Wire.begin(SDA_PIN, SCL_PIN);
   dht20.begin();
-  
-  // Configure OTA
-  setupOTA();
-  
-  // Send initial firmware version to ThingsBoard
-  if (tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT)) {
-    tb.sendAttributeData("firmwareVersion", FIRMWARE_VERSION);
-    Serial.println("Connected to ThingsBoard and sent firmware version");
-    
-    // Fix: Use correct method name
-    if (!tb.Shared_Attributes_Subscribe(processSharedAttributes)) {
-      Serial.println("Failed to subscribe to attributes");
-    } else {
-      Serial.println("Subscribed to shared attributes");
-    }
-  }
 }
 
 void loop() {
-  // Handle ArduinoOTA
-  ArduinoOTA.handle();
+  ArduinoOTA.handle(); // Check for local network OTA updates
   
   delay(10);
-
+  
   if (!reconnect()) {
     return;
   }
@@ -260,22 +174,15 @@ void loop() {
     if (!tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT)) {
       Serial.println("Failed to connect");
       return;
-    } else {
-      // After connecting, subscribe to shared attributes
-      Serial.println("Subscribing to shared attributes...");
-      // Fix: Use correct method name
-      if (!tb.Shared_Attributes_Subscribe(processSharedAttributes)) {
-        Serial.println("Failed to subscribe to attributes");
-      }
     }
-  }
+  }  
   
-  // Check for updates periodically
-  if (millis() - lastOTACheck > OTA_CHECK_INTERVAL) {
-    lastOTACheck = millis();
+  // Check for HTTP updates periodically
+  if (millis() - lastUpdateCheck > CHECK_UPDATE_INTERVAL) {
+    lastUpdateCheck = millis();
     checkForUpdates();
   }
-    
+  
   if (millis() - previousDataSend > telemetrySendInterval) {
     previousDataSend = millis();
 
@@ -302,15 +209,11 @@ void loop() {
     tb.sendAttributeData("bssid", WiFi.BSSIDstr().c_str());
     tb.sendAttributeData("localIp", WiFi.localIP().toString().c_str());
     tb.sendAttributeData("ssid", WiFi.SSID().c_str());
-    
-    // Also regularly send firmware version
-    tb.sendAttributeData("firmwareVersion", FIRMWARE_VERSION);
   }
 
   tb.loop();
 }
-
-  // TODO LIST update:
+  // TODO LIST:
   // 1.  Implement OTA Update:
   //    1.1 Configure the ESP32 to check for firmware updates over HTTP or MQTT.
   //    1.2 Deploy an update server and host a new firmware version.
