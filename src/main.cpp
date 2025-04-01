@@ -14,7 +14,8 @@
 constexpr char WIFI_SSID[] = "Min";
 constexpr char WIFI_PASSWORD[] = "123456789";
 
-constexpr char TOKEN[] = "mae15of5vf8oc2v3bdap";
+constexpr char TOKEN[] = "fiu7c7huy80k83o74mw0"; //LED
+constexpr char TOKEN2[] = "mae15of5vf8oc2v3bdap"; //DHT20
 
 constexpr char THINGSBOARD_SERVER[] = "app.coreiot.io";
 constexpr uint16_t THINGSBOARD_PORT = 1883U;
@@ -28,6 +29,8 @@ QueueHandle_t ledStateQueue;
 
 WiFiClient wifiClient;
 PubSubClient client(wifiClient);
+WiFiClient sensorWifiClient;
+PubSubClient sensorClient(sensorWifiClient);
 
 DHT20 dht20;
 
@@ -59,6 +62,15 @@ void connectThingsBoard() {
   String payload = "{\"shared\":[\"" + String(ledStateControlKey) + "\"]}";
   client.publish("v1/devices/me/attributes", payload.c_str());
   Serial.println("Sent request for shared attributes.");
+}
+
+void connectSensorToThingsBoard() {
+  while (!sensorClient.connect("ESP32SensorClient", TOKEN2, nullptr)) {
+    Serial.print("Failed to connect DHT20 to ThingsBoard, rc=");
+    Serial.println(sensorClient.state());
+    delay(5000);
+  }
+  Serial.println("DHT20 Connected to ThingsBoard");
 }
 
 // Callback function khi nhận được tin nhắn MQTT
@@ -116,15 +128,25 @@ void wifiTask(void *pvParameters) {
 
 // Task to handle MQTT connection and communication with ThingsBoard
 void mqttTask(void *pvParameters) {
+  // Set up both clients
   client.setServer(THINGSBOARD_SERVER, THINGSBOARD_PORT);
   client.setCallback(callback);
-
+  sensorClient.setServer(THINGSBOARD_SERVER, THINGSBOARD_PORT);
+  
   for (;;) {
-      if (!client.connected()) {
-          connectThingsBoard();
-      }
-      client.loop();
-      vTaskDelay(pdMS_TO_TICKS(100)); // Process MQTT messages
+    // Handle LED client
+    if (!client.connected()) {
+      connectThingsBoard();
+    }
+    client.loop();
+    
+    // Handle sensor client
+    if (!sensorClient.connected()) {
+      connectSensorToThingsBoard();
+    }
+    sensorClient.loop();
+    
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
 
@@ -141,54 +163,33 @@ void ledControlTask(void *pvParameters) {
 }
 
 void sensorTask(void *pvParameters) {
-  // Delay first reading to ensure WiFi and MQTT are connected
   vTaskDelay(pdMS_TO_TICKS(5000));
-  
-  // Buffer for JSON payload
-  char msg[MAX_MESSAGE_SIZE];
-  StaticJsonDocument<200> jsonDoc;
-  
+
   for (;;) {
-    // Read sensor data
-    int status = dht20.read();
-    
-    if (status == DHT20_OK) {
-      // Get temperature and humidity values
-      temperature = dht20.getTemperature();
-      humidity = dht20.getHumidity();
+    dht20.read();
+    float temperature = dht20.getTemperature();
+    float humidity = dht20.getHumidity();
+    if (!isnan(humidity) && !isnan(temperature)) {
+      Serial.printf("Nhiệt độ: %.2f°C, Độ ẩm: %.2f%%\n", temperature, humidity);
       
-      Serial.print("Temperature: ");
-      Serial.print(temperature, 1);
-      Serial.print("°C, Humidity: ");
-      Serial.print(humidity, 1);
-      Serial.println("%");
-      
-      // Create JSON document with sensor data
-      jsonDoc.clear();
-      jsonDoc["temperature"] = round(temperature * 10) / 10.0;
-      jsonDoc["humidity"] = round(humidity * 10) / 10.0;
-      
-      // Serialize JSON to string
-      serializeJson(jsonDoc, msg);
-      
-      // Publish to ThingsBoard if connected
-      if (client.connected()) {
-        client.publish("v1/devices/me/telemetry", msg);
-        Serial.println("Sensor data published to ThingsBoard");
-      } else {
-        Serial.println("MQTT client not connected. Data not published.");
-      }
-    }   
-    vTaskDelay(pdMS_TO_TICKS(10000));
+      // Use the sensor client to publish data
+      String payload = "{\"temperature\":" + String(temperature) + 
+                       ",\"humidity\":" + String(humidity) + "}";
+      sensorClient.publish("v1/devices/me/telemetry", payload.c_str());
+    } else {
+      Serial.println("Lỗi đọc cảm biến DHT20!");
+    }
+    vTaskDelay(pdMS_TO_TICKS(30000));
   }
 }
 
 void setup() {
   Serial.begin(115200);
+  Wire.begin(SDA_PIN, SCL_PIN);
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW); // Đảm bảo ban đầu đèn tắt
   dht20.begin();
-
+  
   // Create a queue to pass LED state updates between tasks
   ledStateQueue = xQueueCreate(1, sizeof(bool)); 
 
