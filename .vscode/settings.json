@@ -63,5 +63,8 @@
   "C_Cpp_Runner.msvcSecureNoWarnings": false,
   "idf.espIdfPathWin": "C:/Esp/project/frameworks/esp-idf-v5.4/",
   "idf.toolsPathWin": "C:\\Esp\\project",
-  "cmake.sourceDirectory": "C:/Users/Dell/Desktop/New folder/Code/YoloUNO_PlatformIO-Thingsboard/lib/ArduinoJson/src"
+  "cmake.sourceDirectory": "C:/Users/Dell/Desktop/New folder/Code/YoloUNO_PlatformIO-Thingsboard/lib/ArduinoJson/src",
+  "files.associations": {
+    "cmath": "cpp"
+  }
 }

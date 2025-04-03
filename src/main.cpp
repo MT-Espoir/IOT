@@ -11,29 +11,23 @@
 #include <freertos/queue.h>
 #include "DHT20.h"
 
-// WiFi credentials
 constexpr char WIFI_SSID[] = "Min";
 constexpr char WIFI_PASSWORD[] = "123456789";
 
-// ThingsBoard server details
 constexpr char THINGSBOARD_SERVER[] = "app.coreiot.io";
 constexpr uint16_t THINGSBOARD_PORT = 1883U;
 constexpr uint32_t MAX_MESSAGE_SIZE = 1024U;
 
-// Shared variables
 const char* ledStateControlKey = "ledState";
 volatile bool ledState = false;
 QueueHandle_t ledStateQueue;
 DHT20 dht20;
 
-// Device manager
 #define MAX_DEVICES 10
 
-// Forward declarations for callbacks
 void ledAttributeCallback(char* topic, byte* payload, unsigned int length);
 
-// Device structure to manage multiple devices
-struct TBDevice {
+struct Alldevice {
     const char* name;
     const char* token;
     WiFiClient* wifiClient;
@@ -42,15 +36,12 @@ struct TBDevice {
     void (*callback)(char*, byte*, unsigned int);
 };
 
-// Array to hold all devices
-TBDevice devices[MAX_DEVICES];
+Alldevice devices[MAX_DEVICES];
 int deviceCount = 0;
 
-// Device indices for easy reference
 int ledDeviceIndex = -1;
 int dhtDeviceIndex = -1;
 
-// Function to add a new device
 int addDevice(const char* name, const char* token, void (*callback)(char*, byte*, unsigned int) = nullptr) {
     if (deviceCount >= MAX_DEVICES) return -1;
     
@@ -72,7 +63,6 @@ int addDevice(const char* name, const char* token, void (*callback)(char*, byte*
     return deviceIndex;
 }
 
-// Connect to WiFi
 void connectWifi() {
     Serial.print("Connecting to WiFi...");
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -83,11 +73,10 @@ void connectWifi() {
     Serial.println("Connected to WiFi");
 }
 
-// Connect a device to ThingsBoard
 bool connectDeviceToThingsBoard(int deviceIndex) {
     if (deviceIndex < 0 || deviceIndex >= deviceCount) return false;
     
-    TBDevice& device = devices[deviceIndex];
+    Alldevice& device = devices[deviceIndex];
     String clientId = String(device.name) + "_Client";
     
     if (!device.mqttClient->connected()) {
@@ -168,11 +157,9 @@ void deviceManagerTask(void *pvParameters) {
     for (;;) {
         for (int i = 0; i < deviceCount; i++) {
             if (!connectDeviceToThingsBoard(i)) {
-                // Connection failed, wait before retrying
                 vTaskDelay(pdMS_TO_TICKS(5000));
             }
             
-            // Process MQTT messages
             if (devices[i].connected) {
                 devices[i].mqttClient->loop();
             }
@@ -193,9 +180,8 @@ void ledControlTask(void *pvParameters) {
     }
 }
 
-// DHT sensor reading task
+// DHT sensor reading
 void sensorTask(void *pvParameters) {
-    // Wait for initialization
     vTaskDelay(pdMS_TO_TICKS(5000));
     
     for (;;) {
@@ -216,7 +202,7 @@ void sensorTask(void *pvParameters) {
             Serial.println("Failed to read from DHT20 sensor!");
         }
         
-        vTaskDelay(pdMS_TO_TICKS(30000));
+        vTaskDelay(pdMS_TO_TICKS(10000));
     }
 }
 
@@ -227,16 +213,13 @@ void setup() {
     digitalWrite(LED_PIN, LOW);
     dht20.begin();
     
-    // Create queue for LED state updates
     ledStateQueue = xQueueCreate(1, sizeof(bool));
     
-    // Add devices to device manager
     ledDeviceIndex = addDevice("LED", "fiu7c7huy80k83o74mw0", ledAttributeCallback);
-    dhtDeviceIndex = addDevice("DHT20", "mae15of5vf8oc2v3bdap");
+    //dhtDeviceIndex = addDevice("DHT20", "mae15of5vf8oc2v3bdap");
     
     Serial.printf("Added %d devices\n", deviceCount);
     
-    // Create tasks
     xTaskCreate(wifiTask, "WiFi Task", 4096, NULL, 1, NULL);
     xTaskCreate(deviceManagerTask, "Device Manager", 8192, NULL, 2, NULL);
     xTaskCreate(ledControlTask, "LED Control", 2048, NULL, 3, NULL);
@@ -244,6 +227,5 @@ void setup() {
 }
 
 void loop() {
-    // Loop function is empty in FreeRTOS as tasks are running independently
     vTaskDelay(portMAX_DELAY);
 }
